@@ -18,7 +18,10 @@ frappe.ui.form.on("Job Applicant", {
 		frm.events.show_resume(frm);
 		frm.events.create_custom_buttons(frm);
 		frm.events.get_interview_for_dashboard(frm);
-		frm.toolbar.make_navigation();
+
+		if (!frm.toolbar.page.wrapper.find(".prev-doc").length) {
+			frm.toolbar.make_navigation();
+		}
 	},
 
 	show_resume: function (frm) {
@@ -94,6 +97,8 @@ frappe.ui.form.on("Job Applicant", {
 	},
 
 	get_interview_for_dashboard: function (frm) {
+		if (frm.doc.__islocal) return;
+
 		$("div").remove(".form-dashboard-section.custom");
 		frappe.call({
 			method: "hrms.hr.doctype.job_applicant.job_applicant.get_interview_details",
