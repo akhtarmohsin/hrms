@@ -462,6 +462,17 @@ class PayrollEntry(Document):
 					else:
 						key = (item.salary_component, cost_center)
 						component_dict[key] = component_dict.get(key, 0) + amount_against_cost_center
+						account = self.get_salary_component_account(item.salary_component)
+						if not hasattr(self, "_account_to_source_docs"):
+							self._account_to_source_docs = {}
+						sources = self._account_to_source_docs.setdefault(account, [])
+						source = (
+							("Additional Salary", item.additional_salary)
+							if item.additional_salary
+							else ("Salary Component", item.salary_component)
+						)
+						if source not in sources:
+							sources.append(source)
 
 					if employee_wise_accounting_enabled:
 						self.set_employee_based_payroll_payable_entries(
@@ -491,10 +502,19 @@ class PayrollEntry(Document):
 		cost_center: str,
 		employee_advance: str,
 	) -> None:
+		account = self.get_salary_component_account(item.salary_component)
+		if not hasattr(self, "_account_to_source_docs"):
+			self._account_to_source_docs = {}
+		sources = self._account_to_source_docs.setdefault(account, [])
+		source = ("Employee Advance", employee_advance)
+		if source not in sources:
+			sources.append(source)
+
 		self._advance_deduction_entries.append(
 			{
 				"employee": item.employee,
-				"account": self.get_salary_component_account(item.salary_component),
+				"salary_component": item.salary_component,
+				"account": account,
 				"amount": amount,
 				"cost_center": cost_center,
 				"reference_type": "Employee Advance",
@@ -606,6 +626,7 @@ class PayrollEntry(Document):
 		)
 		self.employee_based_payroll_payable_entries = {}
 		self._advance_deduction_entries = []
+		self._account_to_source_docs = {}
 
 		earnings = (
 			self.get_salary_component_total(
@@ -706,7 +727,11 @@ class PayrollEntry(Document):
 		if voucher_type == "Journal Entry":
 			journal_entry.title = payroll_payable_account
 
-		journal_entry.save(ignore_permissions=True)
+		try:
+			journal_entry.save(ignore_permissions=True)
+		except Exception:
+			self._enrich_jv_error_with_source_doc(journal_entry)
+			raise
 
 		try:
 			if submit_journal_entry:
@@ -723,6 +748,60 @@ class PayrollEntry(Document):
 			raise
 
 		return journal_entry
+
+	def _enrich_jv_error_with_source_doc(self, journal_entry):
+		if not frappe.message_log:
+			return
+
+		try:
+			message_log = frappe.message_log[-1]
+			if isinstance(message_log, str):
+				msg = json.loads(message_log).get("message", "")
+			else:
+				msg = message_log.get("message", "")
+		except Exception:
+			return
+
+		# Parse the row number from messages like "Row 3: ..."
+		import re
+
+		row_match = re.match(r"Row (\d+):", msg)
+		failing_account = None
+		if row_match:
+			row_idx = int(row_match.group(1)) - 1
+			try:
+				failing_account = journal_entry.accounts[row_idx].account
+			except (IndexError, AttributeError):
+				pass
+
+		if not failing_account:
+			# Fall back to matching the account name mentioned in the message
+			for account in getattr(self, "_account_to_source_docs", {}):
+				if account in msg:
+					failing_account = account
+					break
+
+		if not failing_account:
+			return
+
+		source_docs = getattr(self, "_account_to_source_docs", {}).get(failing_account) or []
+		if not source_docs:
+			return
+
+		# Group by doctype for a clean message
+		by_doctype = {}
+		for doctype, name in source_docs:
+			by_doctype.setdefault(doctype, []).append(name)
+
+		hints = [_("Review and validate the following entries:")]
+		for doctype, names in by_doctype.items():
+			hints.append("- {}: {}".format(doctype, ", ".join(names)))
+
+		enriched = msg + "\n" + "\n".join(hints)
+		if isinstance(frappe.message_log[-1], str):
+			frappe.message_log[-1] = json.dumps({"message": enriched})
+		else:
+			frappe.message_log[-1]["message"] = enriched
 
 	def get_payable_amount_for_earnings_and_deductions(
 		self,
@@ -1575,7 +1654,9 @@ def get_month_details(year, month):
 		frappe.throw(_("Fiscal Year {0} not found").format(year))
 
 
-def log_payroll_failure(process, payroll_entry, error):
+def log_payroll_failure(
+	process, payroll_entry, error, employee=None, salary_slip=None, salary_component=None
+):
 	error_log = frappe.log_error(
 		title=_("Salary Slip {0} failed for Payroll Entry {1}").format(process, payroll_entry.name)
 	)
@@ -1589,6 +1670,23 @@ def log_payroll_failure(process, payroll_entry, error):
 	except Exception:
 		error_message = message_log
 
+	prefix_parts = []
+
+	if salary_slip:
+		employee_name = frappe.db.get_value("Salary Slip", salary_slip, "employee_name")
+		identifier = f"{salary_slip} ({employee_name})" if employee_name else salary_slip
+		prefix_parts.append(_("Salary Slip {0}").format(identifier))
+	elif employee:
+		employee_name = frappe.db.get_value("Employee", employee, "employee_name")
+		identifier = f"{employee}: {employee_name}" if employee_name else employee
+		prefix_parts.append(_("Employee {0}").format(identifier))
+
+	if salary_component:
+		prefix_parts.append(_("Salary Component: {0}").format(salary_component))
+
+	if prefix_parts:
+		error_message = "{}: {}".format(", ".join(prefix_parts), error_message)
+
 	error_message += "\n" + _("Check Error Log {0} for more details.").format(
 		get_link_to_form("Error Log", error_log.name)
 	)
@@ -1598,6 +1696,7 @@ def log_payroll_failure(process, payroll_entry, error):
 
 def create_salary_slips_for_employees(employees, args, publish_progress=True):
 	payroll_entry = frappe.get_cached_doc("Payroll Entry", args.payroll_entry)
+	current_employee = None
 
 	try:
 		salary_slips_exist_for = get_existing_salary_slips(employees, args)
@@ -1605,6 +1704,7 @@ def create_salary_slips_for_employees(employees, args, publish_progress=True):
 
 		employees = list(set(employees) - set(salary_slips_exist_for))
 		for emp in employees:
+			current_employee = emp
 			slip_args = {
 				"doctype": "Salary Slip",
 				"employee": emp,
@@ -1644,7 +1744,7 @@ def create_salary_slips_for_employees(employees, args, publish_progress=True):
 	except Exception as e:
 		if not frappe.in_test:
 			frappe.db.rollback()
-		log_payroll_failure("creation", payroll_entry, e)
+		log_payroll_failure("creation", payroll_entry, e, employee=current_employee)
 
 	finally:
 		if not frappe.in_test:
@@ -1696,6 +1796,8 @@ def get_existing_salary_slips(employees, args):
 
 
 def submit_salary_slips_for_employees(payroll_entry, salary_slips, publish_progress=True):
+	current_salary_slip = None
+
 	try:
 		submitted = []
 		unsubmitted = []
@@ -1703,6 +1805,7 @@ def submit_salary_slips_for_employees(payroll_entry, salary_slips, publish_progr
 		count = 0
 
 		for entry in salary_slips:
+			current_salary_slip = entry[0]
 			salary_slip = frappe.get_doc("Salary Slip", entry[0])
 			if salary_slip.net_pay < 0:
 				unsubmitted.append(entry[0])
@@ -1719,6 +1822,7 @@ def submit_salary_slips_for_employees(payroll_entry, salary_slips, publish_progr
 					count * 100 / len(salary_slips), title=_("Submitting Salary Slips...")
 				)
 
+		current_salary_slip = None
 		if submitted:
 			payroll_entry.make_accrual_jv_entry(submitted)
 			payroll_entry.email_salary_slip(submitted)
@@ -1729,7 +1833,18 @@ def submit_salary_slips_for_employees(payroll_entry, salary_slips, publish_progr
 	except Exception as e:
 		if not frappe.in_test:
 			frappe.db.rollback()
-		log_payroll_failure("submission", payroll_entry, e)
+		advance_entries = getattr(payroll_entry, "_advance_deduction_entries", [])
+		unique_components = list(
+			dict.fromkeys(e.get("salary_component") for e in advance_entries if e.get("salary_component"))
+		)
+		salary_component = ", ".join(unique_components) if unique_components else None
+		log_payroll_failure(
+			"submission",
+			payroll_entry,
+			e,
+			salary_slip=current_salary_slip,
+			salary_component=salary_component,
+		)
 
 	finally:
 		if not frappe.in_test:
